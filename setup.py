@@ -1,5 +1,3 @@
-#!/usr/bin/python3
-
 import requests
 import getpass
 import sys
@@ -44,8 +42,24 @@ def prompt_for_api_key(scenescape_path):
 
     # Write to .env file in the scenescape directory for docker-compose
     env_path = os.path.join(scenescape_path, ".env")
-    with open(env_path, "w") as envf:
-        envf.write(f'SCENESCAPE_API_KEY={api_key}\n')
+    key = "SCENESCAPE_API_KEY"
+    new_line = f'{key}={api_key}\n'
+    if os.path.isfile(env_path):
+        with open(env_path, "r") as envf:
+            lines = envf.readlines()
+        replaced = False
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}=") or line.startswith(f"{key} ="):
+                lines[i] = new_line
+                replaced = True
+                break
+        if not replaced:
+            lines.append(new_line)
+        with open(env_path, "w") as envf:
+            envf.writelines(lines)
+    else:
+        with open(env_path, "w") as envf:
+            envf.write(new_line)
     print(f"API key written to {env_path} for docker-compose.")
     return api_key
 
@@ -63,39 +77,26 @@ def ensure_dir_exists(path):
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
 
-def copy_model_and_videos(project_dir, scenescape_dir):
-    # Copy all .mp4 files from <project_dir>/dataset to scenescape/sample_data
-    dataset_dir = os.path.join(project_dir, "dataset")
-    sample_data_dst = os.path.join(scenescape_dir, "sample_data")
-    ensure_dir_exists(sample_data_dst)
-    video_files = glob.glob(os.path.join(dataset_dir, "*.mp4"))
-    if not video_files:
-        print(f"No .mp4 files found in {dataset_dir}")
-    for video in video_files:
-        dst = os.path.join(sample_data_dst, os.path.basename(video))
-        if not os.path.isfile(dst):
-            print(f"Copying video: {video} -> {dst}")
-            shutil.copy2(video, dst)
-        else:
-            print(f"Video already exists, skipping: {dst}")
+def copy_into_volume(src_dir, volume_name):
+    """Copy the contents of src_dir into a named Docker volume using a temporary container."""
+    src_dir = os.path.abspath(src_dir)
+    subprocess.run(
+        [
+            "docker", "run", "--rm",
+            "-v", f"{src_dir}:/src:ro",
+            "-v", f"{volume_name}:/dst",
+            "alpine", "sh", "-c", "cp -rn /src/. /dst/"
+        ],
+        check=True
+    )
 
-    # Copy model directory (recursively)
+def copy_model_and_videos(project_dir, _scenescape_dir):
+    # Copy model directory into the vol-models Docker volume
     src_models = os.path.join(project_dir, "model")
-    dst_models = os.path.join(scenescape_dir, "models")
     if os.path.isdir(src_models):
-        print(f"Copying model files from {src_models} to {dst_models}")
-        for root, dirs, files in os.walk(src_models):
-            rel_path = os.path.relpath(root, src_models)
-            dst_root = os.path.join(dst_models, rel_path)
-            ensure_dir_exists(dst_root)
-            for file in files:
-                src_file = os.path.join(root, file)
-                dst_file = os.path.join(dst_root, file)
-                if not os.path.isfile(dst_file):
-                    print(f"Copying model file: {src_file} -> {dst_file}")
-                    shutil.copy2(src_file, dst_file)
-                else:
-                    print(f"Model file already exists, skipping: {dst_file}")
+        print(f"Copying model files into Docker volume scenescape_vol-models...")
+        copy_into_volume(src_models, "scenescape_vol-models")
+        print("Model files copied into scenescape_vol-models.")
     else:
         print(f"No model directory found at {src_models}")
 
@@ -194,7 +195,7 @@ def select_scene(api_url, api_key):
             print("Invalid selection. Please try again.")
 
 def copy_controller_auth(scenescape_path, app_path):
-    src = os.path.join(scenescape_path, "secrets", "controller.auth")
+    src = os.path.join(scenescape_path, "manager", "secrets", "controller.auth")
     dst = os.path.join(app_path, "controller.auth")
     if not os.path.isfile(src):
         print(f"controller.auth not found at {src}")
@@ -288,19 +289,22 @@ def prompt_create_scene(dataset_dir):
     print("Once the scene is created, press Enter to continue...")
     input()
 
-def ensure_secretsdir_env():
+def ensure_secretsdir_env(scenescape_path=None):
     if "SECRETSDIR" not in os.environ or not os.environ["SECRETSDIR"]:
-        os.environ["SECRETSDIR"] = "secrets"
-        print('Set environment variable: SECRETSDIR=secrets')
+        if scenescape_path:
+            secretsdir = os.path.join(os.path.abspath(scenescape_path), "manager","secrets")
+        else:
+            secretsdir = "./secrets"
+        os.environ["SECRETSDIR"] = secretsdir
+        print(f'Set environment variable: SECRETSDIR={secretsdir}')
 
 def main():
-    ensure_secretsdir_env()
-
     dataset_dir = os.path.join(os.getcwd(), "dataset")
     prompt_create_scene(dataset_dir)
 
     scenescape_path = prompt_for_scenescape_path()
-    ca_cert_path = os.path.join(scenescape_path, "secrets/certs/scenescape-ca.pem")
+    ensure_secretsdir_env(scenescape_path)
+    ca_cert_path = os.path.join(scenescape_path, "manager/secrets/certs/scenescape-ca.pem")
     if not os.path.isfile(ca_cert_path):
         print(f"CA certificate not found at {ca_cert_path}. Please check your SceneScape install.")
         sys.exit(1)
@@ -343,13 +347,11 @@ def main():
     app_path = input(f"Enter the path to your fall_detection_app [{default_app_path}]: ").strip()
     fall_detection_app_path = app_path if app_path else default_app_path
 
-    percebro_version = get_image_version("scenescape-percebro")
     scenescape_version = get_image_version("scenescape")
 
     with open("docker-compose.override.template.yml") as f:
         template = f.read()
-    override = template.replace("{{PERCEBRO_VERSION}}", percebro_version)
-    override = override.replace("{{SCENESCAPE_VERSION}}", scenescape_version)
+    override = template.replace("{{SCENESCAPE_VERSION}}", scenescape_version)
     override = override.replace("{{SCENE_UUID}}", scene_uid)
     override = override.replace("{{FALL_DETECTION_APP_PATH}}", fall_detection_app_path)
     override = override.replace("{{HTTP_PROXY}}", http_proxy)
@@ -361,6 +363,17 @@ def main():
 
     project_dir = os.getcwd()
     copy_model_and_videos(project_dir, scenescape_path)
+
+    # Copy falling-config.json to the scenescape dlstreamer-pipeline-server directory
+    falling_config_src = os.path.join(project_dir, "dlstreamer-pipeline-server", "falling-config.json")
+    falling_config_dst_dir = os.path.join(scenescape_path, "dlstreamer-pipeline-server")
+    ensure_dir_exists(falling_config_dst_dir)
+    falling_config_dst = os.path.join(falling_config_dst_dir, "falling-config.json")
+    if os.path.isfile(falling_config_src):
+        shutil.copy2(falling_config_src, falling_config_dst)
+        print(f"Copied falling-config.json to {falling_config_dst}")
+    else:
+        print(f"Warning: falling-config.json not found at {falling_config_src}")
 
     # Add cameras from calibration file
     api_url = "https://localhost/api/v1/"

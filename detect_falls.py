@@ -157,8 +157,8 @@ def on_message(client, userdata, msg):
         person_features = defaultdict(list)
         canonical_bboxes = {}
         metrics_by_uuid = defaultdict(dict)
-
         for obj in data.get("objects", []):
+            print(f"Processing object: {obj}")
             uuid = obj.get("id")
             if not uuid or obj.get("category") != "person":
                 continue
@@ -166,9 +166,10 @@ def on_message(client, userdata, msg):
             velocity = obj.get("velocity", [0, 0, 0])
             v_mag = float(np.linalg.norm(velocity))
 
-            if "bounding_box_px" in obj and "bounding_box_camera_id" in obj:
-                cam_id = obj["bounding_box_camera_id"]
-                detected_bbox = obj["bounding_box_px"]
+            # Determine camera bounding boxes to process
+            camera_entries = [(cid, bb) for cid, bb in obj.get("camera_bounds", {}).items()]
+
+            for cam_id, detected_bbox in camera_entries:
                 detected_bbox_xyxy = {
                     "x_min": detected_bbox["x"],
                     "y_min": detected_bbox["y"],
@@ -253,7 +254,7 @@ def on_message(client, userdata, msg):
                 aspect_ratio_ratio, v_mag, smoothed_area, area_rate, clip_left, clip_right, clip_top, clip_bottom = feature_vector_smoothed
                 arr_thresh = args.fallen_arr_threshold
                 area_rate_threshold = args.area_rate_threshold
-
+                print(f"UUID: {uuid}, Camera: {cam_id}, v_mag: {v_mag:.3f}, aspect_ratio_ratio: {aspect_ratio_ratio:.3f}, area_rate: {area_rate:.3f}, clip_bottom: {clip_bottom}")
                 if v_mag >= args.run_velocity_threshold:
                     state = "running"
                 elif v_mag >= args.walk_velocity_threshold:
@@ -450,7 +451,7 @@ def main():
         print(json.dumps(calib, indent=2))
 
     sys.stdout.flush()
-
+    print("Initializing MQTT client...")
     userdata = {
         "mqtt_topic": mqtt_topic,
         "camera_calibrations": camera_calibrations,
