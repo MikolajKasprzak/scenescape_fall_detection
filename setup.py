@@ -1,66 +1,66 @@
+#!/usr/bin/env python3
+
 import requests
 import getpass
 import sys
 import os
 from pathlib import Path
-import urllib3
-import ssl
 import re
 import json
-import shutil
-import glob
 import subprocess
-import stat
 import time
-from PIL import Image
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+SCENESCAPE_CERT_HOSTNAME = "web.scenescape.intel.com"
+
+class SceneScapeHTTPSAdapter(requests.adapters.HTTPAdapter):
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["assert_hostname"] = SCENESCAPE_CERT_HOSTNAME
+        pool_kwargs["server_hostname"] = SCENESCAPE_CERT_HOSTNAME
+        return super().init_poolmanager(
+            connections, maxsize, block=block, **pool_kwargs)
 
 session = requests.Session()
-session.verify = False
+session.mount("https://localhost", SceneScapeHTTPSAdapter())
 
-from requests.packages.urllib3.util.ssl_ import create_urllib3_context
+def read_env_file(env_path):
+    values = {}
+    if not os.path.isfile(env_path):
+        return values
+    with open(env_path, "r") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value
+    return values
 
-class HostNameIgnoreAdapter(requests.adapters.HTTPAdapter):
-    def init_poolmanager(self, *args, **kwargs):
-        context = create_urllib3_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        kwargs['ssl_context'] = context
-        return super().init_poolmanager(*args, **kwargs)
+def update_env_file(env_path, values):
+    lines = []
+    if os.path.isfile(env_path):
+        with open(env_path, "r") as env_file:
+            lines = env_file.readlines()
+    remaining = dict(values)
+    for index, line in enumerate(lines):
+        key = line.split("=", 1)[0].strip() if "=" in line else None
+        if key in remaining:
+            lines[index] = f"{key}={remaining.pop(key)}\n"
+    lines.extend(f"{key}={value}\n" for key, value in remaining.items())
+    with open(env_path, "w") as env_file:
+        env_file.writelines(lines)
 
-session.mount('https://', HostNameIgnoreAdapter())
-
-def prompt_for_api_key(scenescape_path):
-    api_key = os.environ.get("SCENESCAPE_API_KEY")
+def prompt_for_api_key(env_path):
+    api_key = os.environ.get("SCENESCAPE_API_KEY") \
+        or read_env_file(env_path).get("SCENESCAPE_API_KEY")
     if api_key:
-        print("Using SceneScape API key from environment variable SCENESCAPE_API_KEY.")
+        print("Using the existing SceneScape API key.")
     else:
         print("Please enter your SceneScape API key (you can find this in the admin panel):")
         api_key = getpass.getpass("API Key: ")
         os.environ["SCENESCAPE_API_KEY"] = api_key  # Set for this process
 
-    # Write to .env file in the scenescape directory for docker-compose
-    env_path = os.path.join(scenescape_path, ".env")
-    key = "SCENESCAPE_API_KEY"
-    new_line = f'{key}={api_key}\n'
-    if os.path.isfile(env_path):
-        with open(env_path, "r") as envf:
-            lines = envf.readlines()
-        replaced = False
-        for i, line in enumerate(lines):
-            if line.startswith(f"{key}=") or line.startswith(f"{key} ="):
-                lines[i] = new_line
-                replaced = True
-                break
-        if not replaced:
-            lines.append(new_line)
-        with open(env_path, "w") as envf:
-            envf.writelines(lines)
-    else:
-        with open(env_path, "w") as envf:
-            envf.write(new_line)
-    print(f"API key written to {env_path} for docker-compose.")
+    update_env_file(env_path, {"SCENESCAPE_API_KEY": api_key})
+    os.chmod(env_path, 0o600)
+    print(f"API key written to app-owned environment file {env_path}.")
     return api_key
 
 def prompt_for_scenescape_path():
@@ -85,27 +85,65 @@ def copy_into_volume(src_dir, volume_name):
             "docker", "run", "--rm",
             "-v", f"{src_dir}:/src:ro",
             "-v", f"{volume_name}:/dst",
-            "alpine", "sh", "-c", "cp -rn /src/. /dst/"
+            "alpine", "sh", "-c", "cp -r /src/. /dst/"
         ],
         check=True
     )
 
-def copy_model_and_videos(project_dir, _scenescape_dir):
-    # Copy model directory into the vol-models Docker volume
+def copy_model_and_videos(project_dir, compose_project_name):
+    volume_prefix = compose_project_name
     src_models = os.path.join(project_dir, "model")
     if os.path.isdir(src_models):
-        print(f"Copying model files into Docker volume scenescape_vol-models...")
-        copy_into_volume(src_models, "scenescape_vol-models")
-        print("Model files copied into scenescape_vol-models.")
+        model_volume = f"{volume_prefix}_vol-models"
+        print(f"Copying model files into Docker volume {model_volume}...")
+        copy_into_volume(src_models, model_volume)
     else:
         print(f"No model directory found at {src_models}")
+
+    src_videos = os.path.join(project_dir, "dataset")
+    video_volume = f"{volume_prefix}_vol-videos"
+    print(f"Copying dataset files into Docker volume {video_volume}...")
+    copy_into_volume(src_videos, video_volume)
+
+def compose_command(scenescape_path, override_path, env_path, *args):
+    base_compose = os.path.join(
+        scenescape_path, "sample_data", "compose", "docker-compose-dl-streamer-example.yml")
+    return [
+        "docker", "compose",
+        "--project-directory", scenescape_path,
+        "--env-file", env_path,
+        "-f", base_compose,
+        "-f", override_path,
+        "--profile", "controller",
+        *args,
+    ]
+
+def start_manager(scenescape_path, override_path, env_path):
+    print("Applying SceneScape manager thread limits...")
+    subprocess.run(
+        compose_command(
+            scenescape_path, override_path, env_path,
+            "up", "-d", "web"),
+        check=True,
+    )
+    readiness_url = "https://localhost:443/api/v1/database-ready"
+    for _ in range(30):
+        try:
+            response = session.get(readiness_url, timeout=5)
+            if response.ok and response.json().get("databaseReady") is True:
+                print("SceneScape manager is ready.")
+                return
+        except (requests.RequestException, ValueError):
+            pass
+        time.sleep(2)
+    raise RuntimeError("SceneScape manager did not become ready in time.")
 
 def get_scenes(api_key, scenescape_path):
     # Use the local API endpoint for scenes
     api_url = "https://localhost/api/v1/"
     headers = {"Authorization": f"Token {api_key}"}
     try:
-        resp = session.get(f"{api_url}scenes", headers=headers, timeout=10, verify=False)
+        resp = session.get(f"{api_url}scenes", headers=headers, timeout=10)
         if resp.status_code == 200:
             return resp.json().get("results", [])
         print("Failed to fetch scenes from API.")
@@ -136,22 +174,54 @@ def get_image_version(image_name):
 
 def add_camera(api_url, api_key, scene_uid, camera):
     headers = {"Authorization": f"Token {api_key}", "Content-Type": "application/json"}
-    # Only send supported fields
+    distortion = camera.get("distortion")
+    if distortion and any(value != 0 for value in distortion.values()):
+        raise ValueError(
+            f"Camera '{camera.get('name')}' has nonzero distortion, which the "
+            "SceneScape 2026.3 camera API cannot store safely."
+        )
+    # The 2026.3 resolution field injects an invalid `cam` model argument.
     payload = {
+        "sensor_id": camera.get("uid"),
         "name": camera.get("name"),
         "scene": scene_uid,
         "translation": camera.get("extrinsics", {}).get("translation", [0, 0, 0]),
         "rotation": camera.get("extrinsics", {}).get("rotation", [0, 0, 0]),
         "scale": camera.get("extrinsics", {}).get("scale", [1, 1, 1]),
+        "intrinsics": camera.get("intrinsics"),
         "transform_type": "euler"
     }
-    resp = session.post(f"{api_url}camera", headers=headers, json=payload, timeout=10, verify=False)
-    if resp.status_code == 201:
-        print(f"Camera '{payload['name']}' created.")
-    elif resp.status_code == 400 and "name" in resp.text:
-        print(f"Camera '{payload['name']}' already exists, skipping.")
+    response = session.get(
+        f"{api_url}cameras?scene={scene_uid}", headers=headers, timeout=10)
+    response.raise_for_status()
+    camera_data = response.json()
+    existing_cameras = camera_data.get("results", []) \
+        if isinstance(camera_data, dict) else camera_data
+    existing = next(
+        (item for item in existing_cameras
+         if item.get("uid") == payload["sensor_id"]
+         or item.get("name") == payload["name"]),
+        None,
+    )
+    if existing:
+        camera_uid = existing.get("uid") or payload["sensor_id"]
+        if existing.get("scene") == scene_uid:
+            payload.pop("scene")
+        response = session.put(
+            f"{api_url}camera/{camera_uid}", headers=headers,
+            json=payload, timeout=10)
+        action = "updated"
     else:
-        print(f"Failed to create camera '{payload['name']}'': {resp.text}")
+        response = session.post(
+            f"{api_url}camera", headers=headers, json=payload, timeout=10)
+        action = "created"
+    if not response.ok:
+        raise requests.HTTPError(
+            f"Camera '{payload['name']}' {action} failed: "
+            f"HTTP {response.status_code}: {response.text}",
+            response=response,
+        )
+    print(f"Camera '{payload['name']}' {action}.")
 
 def load_cameras_from_file(cameras_file):
     with open(cameras_file, "r") as f:
@@ -167,7 +237,7 @@ def load_cameras_from_file(cameras_file):
 def select_scene(api_url, api_key):
     headers = {"Authorization": f"Token {api_key}"}
     try:
-        resp = requests.get(f"{api_url}/scenes", headers=headers, verify=False, timeout=10)
+        resp = session.get(f"{api_url}/scenes", headers=headers, timeout=10)
         resp.raise_for_status()
         scenes = resp.json().get("results", []) if isinstance(resp.json(), dict) else resp.json()
     except Exception as e:
@@ -194,20 +264,14 @@ def select_scene(api_url, api_key):
                 pass
             print("Invalid selection. Please try again.")
 
-def copy_controller_auth(scenescape_path, app_path):
-    src = os.path.join(scenescape_path, "manager", "secrets", "controller.auth")
-    dst = os.path.join(app_path, "controller.auth")
-    if not os.path.isfile(src):
-        print(f"controller.auth not found at {src}")
-        sys.exit(1)
-    print(f"Copying {src} to {dst}")
-    shutil.copy2(src, dst)
-    os.chmod(dst, 0o644)  # <-- Add this line to set permissions to rw-r--r--
-    print(f"Set permissions of {dst} to 644 (rw-r--r--)")
-
-def start_node_red(scenescape_path):
+def start_node_red(scenescape_path, override_path, env_path):
     print("Starting Node-RED container...")
-    subprocess.run(["docker", "compose", "up", "-d", "node-red"], cwd=scenescape_path)
+    subprocess.run(
+        compose_command(
+            scenescape_path, override_path, env_path,
+            "up", "-d", "node-red"),
+        check=True,
+    )
     # Wait for Node-RED to be ready
     for _ in range(30):
         try:
@@ -299,18 +363,27 @@ def ensure_secretsdir_env(scenescape_path=None):
         print(f'Set environment variable: SECRETSDIR={secretsdir}')
 
 def main():
-    dataset_dir = os.path.join(os.getcwd(), "dataset")
+    project_dir = os.path.abspath(os.getcwd())
+    dataset_dir = os.path.join(project_dir, "dataset")
     prompt_create_scene(dataset_dir)
 
-    scenescape_path = prompt_for_scenescape_path()
-    ensure_secretsdir_env(scenescape_path)
+    scenescape_path = os.path.abspath(prompt_for_scenescape_path())
     ca_cert_path = os.path.join(scenescape_path, "manager/secrets/certs/scenescape-ca.pem")
     if not os.path.isfile(ca_cert_path):
         print(f"CA certificate not found at {ca_cert_path}. Please check your SceneScape install.")
         sys.exit(1)
+    session.verify = ca_cert_path
+
+    default_app_path = project_dir
+    app_path = input(
+        f"Enter the path to your fall_detection_app [{default_app_path}]: ").strip()
+    fall_detection_app_path = os.path.abspath(app_path or default_app_path)
+    generated_dir = os.path.join(fall_detection_app_path, ".generated")
+    ensure_dir_exists(generated_dir)
+    env_path = os.path.join(generated_dir, "fall-detection.env")
 
     # Ensure node_red_data exists and is owned by the current user
-    node_red_data_path = os.path.join(scenescape_path, "node_red_data")
+    node_red_data_path = os.path.join(fall_detection_app_path, "node_red_data")
     if not os.path.isdir(node_red_data_path):
         os.makedirs(node_red_data_path, exist_ok=True)
         print(f"Created node_red_data directory at {node_red_data_path}")
@@ -323,7 +396,7 @@ def main():
     except Exception as e:
         print(f"Warning: Could not set ownership of {node_red_data_path}: {e}")
 
-    api_key = prompt_for_api_key(scenescape_path)
+    api_key = prompt_for_api_key(env_path)
 
     # Prompt for API URL (or set default)
     api_url = "https://localhost:443/api/v1"
@@ -342,38 +415,42 @@ def main():
         if not https_proxy and http_proxy:
             https_proxy = http_proxy
 
-    # Prompt for fall_detection_app path to mount
-    default_app_path = os.getcwd()
-    app_path = input(f"Enter the path to your fall_detection_app [{default_app_path}]: ").strip()
-    fall_detection_app_path = app_path if app_path else default_app_path
+    version_path = os.path.join(scenescape_path, "version.txt")
+    with open(version_path, "r") as version_file:
+        scenescape_version = version_file.read().strip()
+    compose_project_name = os.environ.get("COMPOSE_PROJECT_NAME", "scenescape")
+    secrets_dir = os.path.join(scenescape_path, "manager", "secrets")
+    scenescape_env = read_env_file(os.path.join(scenescape_path, ".env"))
+    update_env_file(env_path, {
+        **scenescape_env,
+        "SCENESCAPE_API_KEY": api_key,
+        "SECRETSDIR": secrets_dir,
+        "VERSION": scenescape_version,
+        "COMPOSE_PROJECT_NAME": compose_project_name,
+        "HTTP_PROXY": http_proxy,
+        "HTTPS_PROXY": https_proxy,
+        "http_proxy": http_proxy,
+        "https_proxy": https_proxy,
+        "NO_PROXY": os.environ.get("NO_PROXY", ""),
+        "no_proxy": os.environ.get("no_proxy", ""),
+    })
+    os.chmod(env_path, 0o600)
 
-    scenescape_version = get_image_version("scenescape")
-
-    with open("docker-compose.override.template.yml") as f:
+    template_path = os.path.join(
+        fall_detection_app_path, "docker-compose.override.template.yml")
+    with open(template_path) as f:
         template = f.read()
     override = template.replace("{{SCENESCAPE_VERSION}}", scenescape_version)
     override = override.replace("{{SCENE_UUID}}", scene_uid)
     override = override.replace("{{FALL_DETECTION_APP_PATH}}", fall_detection_app_path)
-    override = override.replace("{{HTTP_PROXY}}", http_proxy)
-    override = override.replace("{{HTTPS_PROXY}}", https_proxy)
-    override_path = os.path.join(scenescape_path, "docker-compose.override.yml")
+    override = override.replace("{{SCENESCAPE_PATH}}", scenescape_path)
+    override_path = os.path.join(generated_dir, "docker-compose.override.yml")
     with open(override_path, "w") as f:
         f.write(override)
-    print(f"Docker-compose override written to {override_path}")
+    print(f"App-owned Docker Compose override written to {override_path}")
 
-    project_dir = os.getcwd()
-    copy_model_and_videos(project_dir, scenescape_path)
-
-    # Copy falling-config.json to the scenescape dlstreamer-pipeline-server directory
-    falling_config_src = os.path.join(project_dir, "dlstreamer-pipeline-server", "falling-config.json")
-    falling_config_dst_dir = os.path.join(scenescape_path, "dlstreamer-pipeline-server")
-    ensure_dir_exists(falling_config_dst_dir)
-    falling_config_dst = os.path.join(falling_config_dst_dir, "falling-config.json")
-    if os.path.isfile(falling_config_src):
-        shutil.copy2(falling_config_src, falling_config_dst)
-        print(f"Copied falling-config.json to {falling_config_dst}")
-    else:
-        print(f"Warning: falling-config.json not found at {falling_config_src}")
+    copy_model_and_videos(project_dir, compose_project_name)
+    start_manager(scenescape_path, override_path, env_path)
 
     # Add cameras from calibration file
     api_url = "https://localhost/api/v1/"
@@ -386,23 +463,26 @@ def main():
     for cam in cameras:
         add_camera(api_url, api_key, scene_uid, cam)
 
-    # Copy controller.auth to app path
-    copy_controller_auth(scenescape_path, fall_detection_app_path)
-
     # Start node-red service
-    start_node_red(scenescape_path)
+    start_node_red(scenescape_path, override_path, env_path)
 
     # Now it's safe to install modules and import flows
     install_npm_modules(modules_to_install)
     setup_flows(
         flows_path=os.path.join(fall_detection_app_path, "flows.json"),
         scene_uuid=scene_uid,
-        auth_path=os.path.join(fall_detection_app_path, "controller.auth")
+        auth_path=os.path.join(
+            scenescape_path, "manager", "secrets", "controller.auth")
     )
 
     print("\nSetup complete!")
     print("Starting all services...")
-    subprocess.run(["docker", "compose", "up", "-d"], cwd=scenescape_path)
+    subprocess.run(
+        compose_command(
+            scenescape_path, override_path, env_path,
+            "up", "-d", "--build"),
+        check=True,
+    )
 
     print("\nYou can now view the Node-RED dashboard UI at:  http://<host>:1880/ui")
     print("And the SceneScape UI at:                       https://<host>\n")

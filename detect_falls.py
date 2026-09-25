@@ -7,19 +7,19 @@ import paho.mqtt.client as mqtt
 import ssl
 import numpy as np
 from scene_common import transform
-from scipy.spatial.transform import Rotation as R
+from scene_common.geometry import Point
 import time
 from collections import defaultdict, deque
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fall Detection App")
-    parser.add_argument('--controller-auth', type=str, default="/app/controller.auth",
+    parser.add_argument('--controller-auth', type=str, default="/run/secrets/controller.auth",
                         help='Path to controller.auth JSON file')
     parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', 1883)),
                         help='Port for both MQTT and API (default: 1883)')
     parser.add_argument('--scene-uuid', type=str, required=True,
                         help='Scene UUID to subscribe/query')
-    parser.add_argument('--insecure', action='store_true', default=True,
+    parser.add_argument('--insecure', action='store_true',
                         help='Run in insecure mode (ignore SSL certs)')
     parser.add_argument('--broker', type=str, required=True,
                         help='MQTT broker hostname or alias')
@@ -39,14 +39,14 @@ def parse_args():
                         help='Area rate threshold for fallen state logic')
     return parser.parse_args()
 
-def get_cameras(api_url, api_key, insecure, retries=5, delay=5):
+def get_cameras(api_url, api_key, verify, retries=5, delay=5):
     headers = {"Authorization": f"Token {api_key}"}
     for attempt in range(1, retries + 1):
         try:
             response = requests.get(
                 api_url,
                 headers=headers,
-                verify=not insecure,
+                verify=verify,
                 timeout=10
             )
             response.raise_for_status()
@@ -69,16 +69,7 @@ def get_cameras(api_url, api_key, insecure, retries=5, delay=5):
                 print("Max retries reached. Giving up.", file=sys.stderr)
     return None
 
-def project_point(pt3d, intrinsics, distortion):
-    fx, fy, cx, cy = intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]
-    x, y, z = pt3d
-    if z == 0:
-        z = 1e-6
-    u = fx * x / z + cx
-    v = fy * y / z + cy
-    return [u, v]
-
-def get_canonical_bbox(obj, intrinsics, distortion, cam_extrinsics):
+def get_canonical_bbox(obj, camera_pose):
     cx, cy, cz = obj["translation"]
     w, d, h = obj["size"]
     r = (w + d) / 8
@@ -90,18 +81,13 @@ def get_canonical_bbox(obj, intrinsics, distortion, cam_extrinsics):
     for ox, oy in offsets:
         corners_3d_world.append([cx + ox, cy + oy, base_z])
         corners_3d_world.append([cx + ox, cy + oy, top_z])
-    corners_3d_cam = [world_to_camera(pt, cam_extrinsics)
+    try:
+        corners_2d = [camera_pose.projectWorldPointToCameraPixels(Point(pt))
                       for pt in corners_3d_world]
-    filtered_corners_2d = []
-    for pt in corners_3d_cam:
-        if pt[2] <= 1e-3:
-            continue
-        filtered_corners_2d.append(project_point(pt, intrinsics, distortion))
-    if not filtered_corners_2d:
-        print("No valid projected 2D corners for canonical bbox (all points behind camera or invalid).")
+    except (TypeError, ValueError):
         return None
-    xs = [pt[0] for pt in filtered_corners_2d]
-    ys = [pt[1] for pt in filtered_corners_2d]
+    xs = [point.x for point in corners_2d]
+    ys = [point.y for point in corners_2d]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
     bbox = {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max}
@@ -158,16 +144,20 @@ def on_message(client, userdata, msg):
         canonical_bboxes = {}
         metrics_by_uuid = defaultdict(dict)
         for obj in data.get("objects", []):
-            print(f"Processing object: {obj}")
             uuid = obj.get("id")
-            if not uuid or obj.get("category") != "person":
+            category = obj.get("category") or obj.get("type")
+            if not uuid or category != "person":
                 continue
 
             velocity = obj.get("velocity", [0, 0, 0])
             v_mag = float(np.linalg.norm(velocity))
 
             # Determine camera bounding boxes to process
-            camera_entries = [(cid, bb) for cid, bb in obj.get("camera_bounds", {}).items()]
+            camera_entries = [
+                (camera_id, bounds)
+                for camera_id, bounds in obj.get("camera_bounds", {}).items()
+                if not bounds.get("projected", False)
+            ]
 
             for cam_id, detected_bbox in camera_entries:
                 detected_bbox_xyxy = {
@@ -176,17 +166,12 @@ def on_message(client, userdata, msg):
                     "x_max": detected_bbox["x"] + detected_bbox["width"],
                     "y_max": detected_bbox["y"] + detected_bbox["height"],
                 }
-                cam_extrinsics = camera_calibrations.get(
-                    cam_id, {}).get("extrinsics")
-                intrinsics = camera_calibrations.get(
-                    cam_id, {}).get("intrinsics")
-                distortion = camera_calibrations.get(
-                    cam_id, {}).get("distortion")
+                camera_pose = camera_calibrations.get(
+                    cam_id, {}).get("camera_pose")
 
                 canonical_bbox = None
-                if intrinsics and distortion and cam_extrinsics:
-                    canonical_bbox = get_canonical_bbox(
-                        obj, intrinsics, distortion, cam_extrinsics)
+                if camera_pose:
+                    canonical_bbox = get_canonical_bbox(obj, camera_pose)
                     if canonical_bbox is not None:
                         canonical_bboxes[cam_id] = canonical_bbox
 
@@ -254,7 +239,6 @@ def on_message(client, userdata, msg):
                 aspect_ratio_ratio, v_mag, smoothed_area, area_rate, clip_left, clip_right, clip_top, clip_bottom = feature_vector_smoothed
                 arr_thresh = args.fallen_arr_threshold
                 area_rate_threshold = args.area_rate_threshold
-                print(f"UUID: {uuid}, Camera: {cam_id}, v_mag: {v_mag:.3f}, aspect_ratio_ratio: {aspect_ratio_ratio:.3f}, area_rate: {area_rate:.3f}, clip_bottom: {clip_bottom}")
                 if v_mag >= args.run_velocity_threshold:
                     state = "running"
                 elif v_mag >= args.walk_velocity_threshold:
@@ -344,16 +328,6 @@ def initialize_mqtt_client(**kwargs):
     else:
         return mqtt.Client(**kwargs)
 
-def world_to_camera(pt_world, cam_extrinsics):
-    t = np.array(cam_extrinsics["translation"])
-    q = cam_extrinsics["rotation"]
-    pose_mat = transform.CameraPose.poseToPoseMat(t, q, [1, 1, 1])
-    pt_world_h = np.array([*pt_world, 1.0])
-    world_to_cam = np.linalg.inv(pose_mat)
-    pt_cam_h = world_to_cam @ pt_world_h
-    pt_cam = pt_cam_h[:3]
-    return pt_cam.tolist()
-
 def bbox_from_pose(pose):
     points = [pt for pt in pose if pt and len(pt) == 2]
     if not points:
@@ -393,33 +367,25 @@ def bbox_clip_flags(bbox, resolution, margin=2):
 
 def main():
     args = parse_args()
-    print(f"Looking for controller.auth at: {args.controller_auth}")
-    print(f"Current working directory: {os.getcwd()}")
 
     api_key = os.environ.get("SCENESCAPE_API_KEY")
-    print(f"Using API key: {api_key[:6]}...")
+    if not api_key:
+        print("SCENESCAPE_API_KEY is required.", file=sys.stderr)
+        return 1
 
     print(f"Scene controller: {args.broker}")
     print(f"Scene UUID: {args.scene_uuid}")
     print(f"Insecure mode: {args.insecure}")
 
-    mqtt_topic = f"scenescape/regulated/scene/{args.scene_uuid}"
+    mqtt_topic = f"scenescape/data/scene/{args.scene_uuid}/person"
     api_url = f"{args.resturl}/cameras?scene={args.scene_uuid}"
     print(f"MQTT topic: {mqtt_topic}")
     print(f"API URL: {api_url}")
 
-    cameras = get_cameras(api_url, api_key, args.insecure)
+    verify = False if args.insecure else args.root_cert
+    cameras = get_cameras(api_url, api_key, verify)
     if cameras is None:
-        print(
-            "Failed to retrieve cameras. Will keep running for debugging.", file=sys.stderr)
-        # Instead of exiting, enter a wait loop for debugging
-        try:
-            while True:
-                print("Waiting for debugging... (press Ctrl+C to exit)")
-                time.sleep(60)
-        except KeyboardInterrupt:
-            print("Exiting on user request.")
-            sys.exit(1)
+        return 1
 
     camera_calibrations = {}
     if isinstance(cameras, dict) and "results" in cameras:
@@ -434,21 +400,20 @@ def main():
         cx = intrinsics.get("cx")
         cy = intrinsics.get("cy")
         resolution = [2 * cx, 2 * cy] if cx and cy else cam.get("resolution")
+        extrinsics = {
+            "translation": cam.get("translation"),
+            "rotation": cam.get("rotation"),
+            "scale": cam.get("scale"),
+        }
+        camera_pose = None
+        if intrinsics and all(extrinsics.values()):
+            camera_intrinsics = transform.CameraIntrinsics(
+                intrinsics, cam.get("distortion"), resolution)
+            camera_pose = transform.CameraPose(extrinsics, camera_intrinsics)
         camera_calibrations[name] = {
-            "extrinsics": {
-                "translation": cam.get("translation"),
-                "rotation": cam.get("rotation"),
-                "scale": cam.get("scale"),
-            },
-            "intrinsics": intrinsics,
-            "distortion": cam.get("distortion"),
+            "camera_pose": camera_pose,
             "resolution": resolution,
         }
-
-    # Example: print calibration for each camera
-    for cam_name, calib in camera_calibrations.items():
-        print(f"\nCalibration for {cam_name}:")
-        print(json.dumps(calib, indent=2))
 
     sys.stdout.flush()
     print("Initializing MQTT client...")
@@ -468,21 +433,20 @@ def main():
             auth = json.load(f)
         mqtt_client.username_pw_set(auth["user"], auth["password"])
 
-        mqtt_client.tls_set(cert_reqs=ssl.CERT_NONE)
-        mqtt_client.tls_insecure_set(True)
+        if args.insecure:
+            mqtt_client.tls_set(cert_reqs=ssl.CERT_NONE)
+            mqtt_client.tls_insecure_set(True)
+        else:
+            mqtt_client.tls_set(
+                ca_certs=args.root_cert, cert_reqs=ssl.CERT_REQUIRED)
 
         print(f"Connecting to MQTT broker at {args.broker}:{args.port} ...")
         mqtt_client.connect(args.broker, args.port, 60)
         mqtt_client.loop_forever()
     except Exception as e:
         print(f"Error during MQTT setup or main loop: {e}", file=sys.stderr)
-        print("Entering wait loop for debugging. (press Ctrl+C to exit)")
-        try:
-            while True:
-                time.sleep(60)
-        except KeyboardInterrupt:
-            print("Exiting on user request.")
-            sys.exit(1)
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,9 +1,24 @@
 services:
+  scene:
+    command: >
+      --restauth /run/secrets/controller.auth
+      --brokerauth /run/secrets/controller.auth
+      --broker broker.scenescape.intel.com
+      --ntp ntpserv
+      --visibility_topic unregulated
+
+  web:
+    environment:
+      - OPENBLAS_NUM_THREADS=1
+      - OMP_NUM_THREADS=1
+
   falling-cams:
     image: linuxserver/ffmpeg:version-8.1-cli
+    profiles:
+      - controller
     command: -nostdin -re -stream_loop -1 -i /workspace/media/fall_cam_1_full.mp4 -re -stream_loop -1 -i /workspace/media/fall_cam_2_full.mp4 -map 0:v -c copy -f rtsp -rtsp_transport tcp rtsp://mediaserver:8554/falling-cam1 -map 1:v -c copy -f rtsp -rtsp_transport tcp rtsp://mediaserver:8554/falling-cam2
     volumes:
-      - {{FALL_DETECTION_APP_PATH}}/dataset:/workspace/media
+      - vol-videos:/workspace/media
     networks:
       - scenescape
     depends_on:
@@ -12,7 +27,9 @@ services:
     pids_limit: 1000
 
   falling-video:
-    image: docker.io/intel/dlstreamer-pipeline-server:2026.1.0-ubuntu24
+    image: docker.io/intel/dlstreamer-pipeline-server:2026.3.0-20260915-weekly-ubuntu24
+    profiles:
+      - controller
     networks:
       - scenescape
     tty: true
@@ -43,6 +60,7 @@ services:
       start_period: 10s
     environment:
       - RUN_MODE=EVA
+      - ADDITIONAL_GST_PLUGIN_PATH=/home/sscape
       - ADD_UTCTIME_TO_METADATA=true
       - APPEND_PIPELINE_NAME_TO_PUBLISHER_TOPIC=false
       - MQTT_HOST=broker.scenescape.intel.com
@@ -52,14 +70,14 @@ services:
       - https_proxy=${https_proxy}
       - HTTP_PROXY=${HTTP_PROXY}
       - http_proxy=${http_proxy}
-      - NO_PROXY=mediaserver,${NO_PROXY}
-      - no_proxy=mediaserver,${no_proxy}
+      - NO_PROXY=mediaserver,.scenescape.intel.com,${NO_PROXY}
+      - no_proxy=mediaserver,.scenescape.intel.com,${no_proxy}
     configs:
       - source: falling-config
         target: /home/pipeline-server/config.json
     volumes:
-      - ./dlstreamer-pipeline-server/user_scripts:/home/pipeline-server/user_scripts
-      - ./models:/home/pipeline-server/models
+      - {{SCENESCAPE_PATH}}/dlstreamer-pipeline-server/user_scripts/gstplugins:/home/sscape/python:ro
+      - vol-models:/home/pipeline-server/models
       - vol-dlstreamer-pipeline-server-pipeline-root-fall:/var/cache/pipeline_root:uid=1999,gid=1999
     secrets:
       - source: root-cert
@@ -68,20 +86,23 @@ services:
     pids_limit: 1000
 
   fall-detection:
-    image: scenescape-controller:{{SCENESCAPE_VERSION}}
+    image: scenescape-fall-detection:{{SCENESCAPE_VERSION}}
+    build:
+      context: {{FALL_DETECTION_APP_PATH}}
+      dockerfile: Dockerfile.fall-detection
+      args:
+        SCENESCAPE_VERSION: {{SCENESCAPE_VERSION}}
+    profiles:
+      - controller
     container_name: fall-detection
-    volumes:
-      - {{FALL_DETECTION_APP_PATH}}:/app
-    working_dir: /app
     environment:
       - SCENESCAPE_API_KEY=${SCENESCAPE_API_KEY}
-      - PYTHONUNBUFFERED=1
       - HTTPS_PROXY=${HTTPS_PROXY}
       - https_proxy=${https_proxy}
       - HTTP_PROXY=${HTTP_PROXY}
       - http_proxy=${http_proxy}
-      - NO_PROXY=mediaserver,${NO_PROXY}
-      - no_proxy=mediaserver,${no_proxy}
+      - NO_PROXY=.scenescape.intel.com,${NO_PROXY}
+      - no_proxy=.scenescape.intel.com,${no_proxy}
     networks:
       - scenescape
     depends_on:
@@ -89,18 +110,25 @@ services:
         condition: service_healthy
       broker:
         condition: service_started
-    entrypoint: ["python3"]
+      analytics:
+        condition: service_started
+    secrets:
+      - source: root-cert
+        target: certs/scenescape-ca.pem
+      - source: controller-auth-file
+        target: /run/secrets/controller.auth
+    restart: on-failure
     command:
       [
-        "/app/detect_falls.py",
         "--broker", "broker.scenescape.intel.com",
         "--resturl", "https://web.scenescape.intel.com:443/api/v1",
-        "--scene-uuid", "{{SCENE_UUID}}",
-        "--insecure"
+        "--scene-uuid", "{{SCENE_UUID}}"
       ]
 
   node-red:
     image: nodered/node-red:latest
+    profiles:
+      - controller
     container_name: node-red
     ports:
       - "1880:1880"
@@ -110,8 +138,11 @@ services:
       - no_proxy=localhost,127.0.0.1
     networks:
       - scenescape
+    depends_on:
+      broker:
+        condition: service_started
     volumes:
-      - ./node_red_data:/data
+      - {{FALL_DETECTION_APP_PATH}}/node_red_data:/data
 
 configs:
   falling-config:
