@@ -1,0 +1,9 @@
+ARG SCENESCAPE_VERSION=2026.3.0-dev
+FROM intel/scenescape-controller:${SCENESCAPE_VERSION}
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY --chown=1001:1001 detect_falls.py /app/detect_falls.py
+
+ENTRYPOINT ["python3", "/app/detect_falls.py"]
