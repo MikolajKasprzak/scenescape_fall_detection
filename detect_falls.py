@@ -7,7 +7,6 @@ import paho.mqtt.client as mqtt
 import ssl
 import numpy as np
 from scene_common import transform
-from scene_common.geometry import Point
 import time
 from collections import defaultdict, deque
 
@@ -69,7 +68,26 @@ def get_cameras(api_url, api_key, verify, retries=5, delay=5):
                 print("Max retries reached. Giving up.", file=sys.stderr)
     return None
 
-def get_canonical_bbox(obj, camera_pose):
+def project_point(pt3d, intrinsics, distortion):
+    fx, fy, cx, cy = intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]
+    x, y, z = pt3d
+    if z == 0:
+        z = 1e-6
+    u = fx * x / z + cx
+    v = fy * y / z + cy
+    return [u, v]
+
+def world_to_camera(pt_world, cam_extrinsics):
+    translation = np.array(cam_extrinsics["translation"])
+    rotation = cam_extrinsics["rotation"]
+    pose_mat = transform.CameraPose._poseToPoseMat(translation, rotation, [1, 1, 1])
+    pt_world_h = np.array([*pt_world, 1.0])
+    world_to_cam = np.linalg.inv(pose_mat)
+    pt_cam_h = world_to_cam @ pt_world_h
+    pt_cam = pt_cam_h[:3]
+    return pt_cam.tolist()
+
+def get_canonical_bbox(obj, intrinsics, distortion, cam_extrinsics):
     cx, cy, cz = obj["translation"]
     w, d, h = obj["size"]
     r = (w + d) / 8
@@ -81,13 +99,18 @@ def get_canonical_bbox(obj, camera_pose):
     for ox, oy in offsets:
         corners_3d_world.append([cx + ox, cy + oy, base_z])
         corners_3d_world.append([cx + ox, cy + oy, top_z])
-    try:
-        corners_2d = [camera_pose.projectWorldPointToCameraPixels(Point(pt))
+    corners_3d_cam = [world_to_camera(pt, cam_extrinsics)
                       for pt in corners_3d_world]
-    except (TypeError, ValueError):
+    filtered_corners_2d = []
+    for pt in corners_3d_cam:
+        if pt[2] <= 1e-3:
+            continue
+        filtered_corners_2d.append(project_point(pt, intrinsics, distortion))
+    if not filtered_corners_2d:
+        print("No valid projected 2D corners for canonical bbox (all points behind camera or invalid).")
         return None
-    xs = [point.x for point in corners_2d]
-    ys = [point.y for point in corners_2d]
+    xs = [pt[0] for pt in filtered_corners_2d]
+    ys = [pt[1] for pt in filtered_corners_2d]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
     bbox = {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max}
@@ -166,12 +189,15 @@ def on_message(client, userdata, msg):
                     "x_max": detected_bbox["x"] + detected_bbox["width"],
                     "y_max": detected_bbox["y"] + detected_bbox["height"],
                 }
-                camera_pose = camera_calibrations.get(
-                    cam_id, {}).get("camera_pose")
+                calibration = camera_calibrations.get(cam_id, {})
+                cam_extrinsics = calibration.get("extrinsics")
+                intrinsics = calibration.get("intrinsics")
+                distortion = calibration.get("distortion")
 
                 canonical_bbox = None
-                if camera_pose:
-                    canonical_bbox = get_canonical_bbox(obj, camera_pose)
+                if intrinsics and cam_extrinsics and all(cam_extrinsics.values()):
+                    canonical_bbox = get_canonical_bbox(
+                        obj, intrinsics, distortion, cam_extrinsics)
                     if canonical_bbox is not None:
                         canonical_bboxes[cam_id] = canonical_bbox
 
@@ -405,13 +431,10 @@ def main():
             "rotation": cam.get("rotation"),
             "scale": cam.get("scale"),
         }
-        camera_pose = None
-        if intrinsics and all(extrinsics.values()):
-            camera_intrinsics = transform.CameraIntrinsics(
-                intrinsics, cam.get("distortion"), resolution)
-            camera_pose = transform.CameraPose(extrinsics, camera_intrinsics)
         camera_calibrations[name] = {
-            "camera_pose": camera_pose,
+            "extrinsics": extrinsics,
+            "intrinsics": intrinsics,
+            "distortion": cam.get("distortion"),
             "resolution": resolution,
         }
 
