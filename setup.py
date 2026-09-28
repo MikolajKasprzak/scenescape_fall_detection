@@ -222,6 +222,19 @@ def add_camera(api_url, api_key, scene_uid, camera):
             response=response,
         )
     print(f"Camera '{payload['name']}' {action}.")
+    if action == "created":
+        return payload["sensor_id"]
+    return None
+
+def record_created_camera(generated_dir, scene_uid, camera_uid):
+    path = os.path.join(generated_dir, "created-cameras.json")
+    with open(path, "r") as registry_file:
+        created_cameras = json.load(registry_file)
+    entry = {"scene": scene_uid, "uid": camera_uid}
+    if entry not in created_cameras:
+        created_cameras.append(entry)
+        with open(path, "w") as registry_file:
+            json.dump(created_cameras, registry_file)
 
 def load_cameras_from_file(cameras_file):
     with open(cameras_file, "r") as f:
@@ -380,6 +393,10 @@ def main():
     fall_detection_app_path = os.path.abspath(app_path or default_app_path)
     generated_dir = os.path.join(fall_detection_app_path, ".generated")
     ensure_dir_exists(generated_dir)
+    created_cameras_path = os.path.join(generated_dir, "created-cameras.json")
+    if not os.path.exists(created_cameras_path):
+        with open(created_cameras_path, "w") as registry_file:
+            json.dump([], registry_file)
     env_path = os.path.join(generated_dir, "fall-detection.env")
 
     # Ensure node_red_data exists and is owned by the current user
@@ -461,7 +478,9 @@ def main():
         sys.exit(1)
     cameras = load_cameras_from_file(cameras_file)
     for cam in cameras:
-        add_camera(api_url, api_key, scene_uid, cam)
+        created_uid = add_camera(api_url, api_key, scene_uid, cam)
+        if created_uid:
+            record_created_camera(generated_dir, scene_uid, created_uid)
 
     # Start node-red service
     start_node_red(scenescape_path, override_path, env_path)

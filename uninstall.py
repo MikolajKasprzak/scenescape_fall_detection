@@ -47,22 +47,28 @@ def compose_command(scenescape_path, override_path, env_path, *args):
     base_compose = os.path.join(
         scenescape_path, "sample_data", "compose",
         "docker-compose-dl-streamer-example.yml")
-    return [
+    command = [
         "docker", "compose",
         "--project-directory", scenescape_path,
         "--env-file", env_path,
         "-f", base_compose,
-        "-f", override_path,
-        "--profile", "controller",
-        *args,
     ]
+    if override_path:
+        command.extend(["-f", override_path])
+    return [*command, "--profile", "controller", *args]
 
 
-def delete_app_cameras(app_path, api_key, ca_cert):
-    with open(os.path.join(app_path, "dataset", "cameras.json"), "r") as camera_file:
-        camera_data = json.load(camera_file)
-    configured = camera_data.get("cameras", camera_data)
-    configured_ids = {camera.get("uid") for camera in configured}
+def delete_app_cameras(generated_dir, api_key, ca_cert):
+    registry_path = os.path.join(generated_dir, "created-cameras.json")
+    if not os.path.isfile(registry_path):
+        print("No camera ownership record found; leaving cameras unchanged.")
+        return
+    with open(registry_path, "r") as registry_file:
+        created_cameras = json.load(registry_file)
+    owned = {(entry["scene"], entry["uid"]) for entry in created_cameras}
+    if not owned:
+        print("No app-created cameras to delete.")
+        return
 
     api_url = "https://localhost:443/api/v1"
     headers = {"Authorization": f"Token {api_key}"}
@@ -74,7 +80,7 @@ def delete_app_cameras(app_path, api_key, ca_cert):
         if isinstance(response_data, dict) else response_data
     for camera in cameras:
         camera_id = camera.get("uid") or camera.get("id")
-        if camera_id not in configured_ids:
+        if (camera.get("scene"), camera_id) not in owned:
             continue
         response = session.delete(
             f"{api_url}/camera/{camera_id}", headers=headers,
@@ -99,18 +105,26 @@ def main():
                 "falling-cams", "falling-video", "fall-detection", "node-red"),
             check=True,
         )
+        base_command = compose_command(scenescape_path, None, env_path)
+        running_scene = subprocess.run(
+            [*base_command, "ps", "--status", "running", "-q", "scene"],
+            check=True, capture_output=True, text=True)
+        if running_scene.stdout.strip():
+            subprocess.run(
+                [*base_command, "up", "-d", "--no-deps", "scene"],
+                check=True)
     else:
         print("Generated deployment files not found; no app containers were removed.")
 
     env_values = read_env(env_path)
     api_key = os.environ.get("SCENESCAPE_API_KEY") \
         or env_values.get("SCENESCAPE_API_KEY")
-    remove_cameras = input("Delete the configured fall-detection cameras? [y/N]: ").strip().lower()
+    remove_cameras = input("Delete cameras created by this app? [y/N]: ").strip().lower()
     if remove_cameras in ("y", "yes"):
         api_key = api_key or getpass.getpass("SceneScape API key: ")
         ca_cert = os.path.join(
             scenescape_path, "manager", "secrets", "certs", "scenescape-ca.pem")
-        delete_app_cameras(app_path, api_key, ca_cert)
+        delete_app_cameras(generated_dir, api_key, ca_cert)
 
     remove_node_red = input("Delete app-owned Node-RED data? [y/N]: ").strip().lower()
     if remove_node_red in ("y", "yes"):
