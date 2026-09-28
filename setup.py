@@ -10,7 +10,8 @@ import json
 import subprocess
 import time
 
-SCENESCAPE_CERT_HOSTNAME = "web.scenescape.intel.com"
+SCENESCAPE_CERT_HOSTNAME = os.environ.get(
+    "SCENESCAPE_CERT_HOSTNAME", "web.scenescape.intel.com")
 
 class SceneScapeHTTPSAdapter(requests.adapters.HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
