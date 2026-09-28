@@ -41,6 +41,8 @@ The fall detection system leverages SceneScape’s multi-camera tracking and 3D 
 - A SceneScape `2026.3.x` checkout with its images and secrets initialized.
 - SceneScape must be running with the **Controller** profile. This profile starts both the Scene Controller and Analytics service that publishes regulated scene data.
 
+If the SceneScape web certificate uses a different hostname, export `SCENESCAPE_CERT_HOSTNAME` before running `setup.py` or `uninstall.py` (for example, `export SCENESCAPE_CERT_HOSTNAME=web.example.com`). The default is `web.scenescape.intel.com`; the configured name must match the certificate.
+
 Fetch the model and video assets before setup. Git LFS pointer files are not playable media:
 
 ```sh
@@ -136,7 +138,7 @@ To stop and remove only this application's services and generated state, run:
 python3 uninstall.py
 ```
 
-The script optionally removes the two configured cameras and app-owned Node-RED data. It does not delete SceneScape files, SceneScape environment settings, or shared Docker volumes.
+The script optionally removes cameras recorded as created by this app and app-owned Node-RED data. Cameras that existed before setup are left intact. It restores the running Scene Controller to the base Compose configuration without deleting SceneScape files, environment settings, or shared Docker volumes. If an earlier setup did not record camera ownership, uninstall leaves those cameras untouched.
 
 ---
 
@@ -161,7 +163,7 @@ fall_detection_app/
 
 - Configuration is handled by `setup.py`; no manual editing of SceneScape files or Node-RED flows is required.
 - Node-RED state persists in the app-owned `node_red_data/` directory.
-- Detections are consumed from `scenescape/regulated/scene/<scene-id>` and fall results are published to `scenescape/fall-detection/<scene-id>`.
+- Detections are consumed from `scenescape/data/scene/<scene-id>/person` and fall results are published to `scenescape/fall-detection/<scene-id>`.
 - Only detector-observed camera bounds (`projected: false`) are used as posture evidence.
 
 ---
