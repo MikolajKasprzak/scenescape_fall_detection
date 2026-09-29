@@ -6,7 +6,6 @@ import sys
 import paho.mqtt.client as mqtt
 import ssl
 import numpy as np
-from scene_common import transform
 import time
 from collections import defaultdict, deque
 
@@ -77,10 +76,41 @@ def project_point(pt3d, intrinsics, distortion):
     v = fy * y / z + cy
     return [u, v]
 
+def pose_to_pose_mat(translation, rotation, scale):
+    if len(rotation) == 4:
+        x, y, z, w = np.asarray(rotation, dtype=float)
+        norm = np.linalg.norm([x, y, z, w])
+        if norm == 0:
+            raise ValueError("Quaternion rotation must not be zero")
+        x, y, z, w = np.array([x, y, z, w]) / norm
+        rotation_mat = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ])
+    elif len(rotation) == 3:
+        x, y, z = np.radians(rotation)
+        rotation_x = np.array([
+            [1, 0, 0], [0, np.cos(x), -np.sin(x)], [0, np.sin(x), np.cos(x)]])
+        rotation_y = np.array([
+            [np.cos(y), 0, np.sin(y)], [0, 1, 0], [-np.sin(y), 0, np.cos(y)]])
+        rotation_z = np.array([
+            [np.cos(z), -np.sin(z), 0], [np.sin(z), np.cos(z), 0], [0, 0, 1]])
+        rotation_mat = rotation_x @ rotation_y @ rotation_z
+    else:
+        raise ValueError("Rotation must contain three Euler angles or four quaternion values")
+
+    pose_mat = np.eye(4)
+    pose_mat[:3, :3] = rotation_mat @ np.diag(scale)
+    pose_mat[:3, 3] = translation
+    return pose_mat
+
 def world_to_camera(pt_world, cam_extrinsics):
-    translation = np.array(cam_extrinsics["translation"])
-    rotation = cam_extrinsics["rotation"]
-    pose_mat = transform.CameraPose._poseToPoseMat(translation, rotation, [1, 1, 1])
+    pose_mat = pose_to_pose_mat(
+        cam_extrinsics["translation"],
+        cam_extrinsics["rotation"],
+        cam_extrinsics.get("scale") or [1, 1, 1],
+    )
     pt_world_h = np.array([*pt_world, 1.0])
     world_to_cam = np.linalg.inv(pose_mat)
     pt_cam_h = world_to_cam @ pt_world_h

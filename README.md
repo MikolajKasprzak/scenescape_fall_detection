@@ -162,6 +162,7 @@ fall_detection_app/
 ## Notes
 
 - Configuration is handled by `setup.py`; no manual editing of SceneScape files or Node-RED flows is required.
+- The fall detector uses a standalone Alpine Python image and does not depend on the SceneScape controller image.
 - Node-RED state persists in the app-owned `node_red_data/` directory.
 - Detections are consumed from `scenescape/data/scene/<scene-id>/person` and fall results are published to `scenescape/fall-detection/<scene-id>`.
 - Only detector-observed camera bounds (`projected: false`) are used as posture evidence.

@@ -90,8 +90,6 @@ services:
     build:
       context: {{FALL_DETECTION_APP_PATH}}
       dockerfile: Dockerfile.fall-detection
-      args:
-        SCENESCAPE_VERSION: {{SCENESCAPE_VERSION}}
     profiles:
       - controller
     container_name: fall-detection
