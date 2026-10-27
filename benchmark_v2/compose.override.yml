@@ -1,0 +1,16 @@
+services:
+  scene:
+    command: >
+      --restauth /run/secrets/controller.auth
+      --brokerauth /run/secrets/controller.auth
+      --broker broker.scenescape.intel.com
+      --ntp ntpserv
+      --visibility_topic unregulated
+    # environment:
+    #   OPENBLAS_NUM_THREADS: "1"
+    #   OMP_NUM_THREADS: "1"
+    #   MKL_NUM_THREADS: "1"
+  # web:
+  #   environment:
+  #     OPENBLAS_NUM_THREADS: "1"
+  #     OMP_NUM_THREADS: "1"

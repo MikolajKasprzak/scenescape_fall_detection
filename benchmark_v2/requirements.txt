@@ -1,0 +1,4 @@
+numpy
+requests
+scipy
+trimesh>=4.6
